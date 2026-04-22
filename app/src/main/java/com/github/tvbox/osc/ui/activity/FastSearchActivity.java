@@ -22,9 +22,13 @@ import com.github.tvbox.osc.bean.Movie;
 import com.github.tvbox.osc.bean.SourceBean;
 import com.github.tvbox.osc.event.RefreshEvent;
 import com.github.tvbox.osc.event.ServerEvent;
+import com.github.tvbox.osc.bean.AggregatedResult;
+import com.github.tvbox.osc.bean.SourceResult;
 import com.github.tvbox.osc.ui.adapter.FastListAdapter;
 import com.github.tvbox.osc.ui.adapter.FastSearchAdapter;
+import com.github.tvbox.osc.ui.adapter.SearchAggregatedAdapter;
 import com.github.tvbox.osc.ui.adapter.SearchWordAdapter;
+import com.chad.library.adapter.base.entity.MultiItemEntity;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
 import com.github.tvbox.osc.util.HistoryHelper;
 import com.github.tvbox.osc.util.SearchHelper;
@@ -39,9 +43,14 @@ import org.greenrobot.eventbus.Subscribe;
 import org.greenrobot.eventbus.ThreadMode;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -61,7 +70,7 @@ public class FastSearchActivity extends BaseActivity {
     SourceViewModel sourceViewModel;
 
     private SearchWordAdapter searchWordAdapter;
-    private FastSearchAdapter searchAdapter;
+    private SearchAggregatedAdapter aggregatedAdapter;
     private FastSearchAdapter searchAdapterFilter;
     private FastListAdapter spListAdapter;
     private String searchTitle = "";
@@ -71,6 +80,10 @@ public class FastSearchActivity extends BaseActivity {
     private HashMap<String, ArrayList<Movie.Video>> resultVods; // 搜索结果
     private final List<String> quickSearchWord = new ArrayList<>();
     private HashMap<String, String> mCheckSources = null;
+
+    private final ConcurrentHashMap<String, Long> sourceStartTime = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> sourceSpeedMap = new ConcurrentHashMap<>();
+    private final List<Movie.Video> allResults = Collections.synchronizedList(new ArrayList<>());
 
     private final View.OnFocusChangeListener focusChangeListener = new View.OnFocusChangeListener() {
         @Override
@@ -161,30 +174,41 @@ public class FastSearchActivity extends BaseActivity {
         });
 
         mGridView.setHasFixedSize(true);
-        mGridView.setLayoutManager(new V7GridLayoutManager(this.mContext, 5));
+        mGridView.setLayoutManager(new V7LinearLayoutManager(this.mContext, 1, false));
 
-        searchAdapter = new FastSearchAdapter();
-        mGridView.setAdapter(searchAdapter);
+        aggregatedAdapter = new SearchAggregatedAdapter();
+        mGridView.setAdapter(aggregatedAdapter);
 
-        searchAdapter.setOnItemClickListener(new BaseQuickAdapter.OnItemClickListener() {
+        aggregatedAdapter.setOnItemClickListener(new BaseQuickAdapter.OnItemClickListener() {
             @Override
             public void onItemClick(BaseQuickAdapter adapter, View view, int position) {
                 FastClickCheckUtil.check(view);
-                Movie.Video video = searchAdapter.getData().get(position);
-                if (video != null) {
-                    try {
-                        if (searchExecutorService != null) {
-                            pauseRunnable = searchExecutorService.shutdownNow();
-                            searchExecutorService = null;
-                            JsLoader.stopAll();
-                        }
-                    } catch (Throwable th) {
-                        th.printStackTrace();
+                MultiItemEntity item = aggregatedAdapter.getData().get(position);
+                if (item instanceof AggregatedResult) {
+                    AggregatedResult header = (AggregatedResult) item;
+                    if (header.isExpanded()) {
+                        aggregatedAdapter.collapse(position);
+                    } else {
+                        aggregatedAdapter.expand(position);
                     }
-                    Bundle bundle = new Bundle();
-                    bundle.putString("id", video.id);
-                    bundle.putString("sourceKey", video.sourceKey);
-                    jumpActivity(DetailActivity.class, bundle);
+                } else if (item instanceof SourceResult) {
+                    SourceResult source = (SourceResult) item;
+                    Movie.Video video = source.video;
+                    if (video != null) {
+                        try {
+                            if (searchExecutorService != null) {
+                                pauseRunnable = searchExecutorService.shutdownNow();
+                                searchExecutorService = null;
+                                JsLoader.stopAll();
+                            }
+                        } catch (Throwable th) {
+                            th.printStackTrace();
+                        }
+                        Bundle bundle = new Bundle();
+                        bundle.putString("id", video.id);
+                        bundle.putString("sourceKey", video.sourceKey);
+                        jumpActivity(DetailActivity.class, bundle);
+                    }
                 }
             }
         });
@@ -346,8 +370,11 @@ public class FastSearchActivity extends BaseActivity {
         fenci();
         mGridView.setVisibility(View.INVISIBLE);
         mGridViewFilter.setVisibility(View.GONE);
-        searchAdapter.setNewData(new ArrayList<>());
+        aggregatedAdapter.setNewData(new ArrayList<>());
         searchAdapterFilter.setNewData(new ArrayList<>());
+        allResults.clear();
+        sourceStartTime.clear();
+        sourceSpeedMap.clear();
 
         spListAdapter.reset();
         resultVods.clear();
@@ -374,7 +401,7 @@ public class FastSearchActivity extends BaseActivity {
         } catch (Throwable th) {
             th.printStackTrace();
         } finally {
-            searchAdapter.setNewData(new ArrayList<>());
+            aggregatedAdapter.setNewData(new ArrayList<>());
             searchAdapterFilter.setNewData(new ArrayList<>());
             allRunCount.set(0);
         }
@@ -408,6 +435,7 @@ public class FastSearchActivity extends BaseActivity {
                 @Override
                 public void run() {
                     try {
+                        sourceStartTime.put(key, System.currentTimeMillis());
                         sourceViewModel.getSearch(key, searchTitle);
                     } catch (Exception e) {
 
@@ -457,36 +485,79 @@ public class FastSearchActivity extends BaseActivity {
         String lastSourceKey = "";
 
         if (absXml != null && absXml.movie != null && absXml.movie.videoList != null && absXml.movie.videoList.size() > 0) {
-            List<Movie.Video> data = new ArrayList<>();
             for (Movie.Video video : absXml.movie.videoList) {
                 if (!matchSearchResult(video.name, searchTitle)) continue;
-                data.add(video);
-                if (!resultVods.containsKey(video.sourceKey)) {
-                    resultVods.put(video.sourceKey, new ArrayList<Movie.Video>());
+                allResults.add(video);
+                String sk = video.sourceKey;
+                Long start = sourceStartTime.get(sk);
+                if (start != null && !sourceSpeedMap.containsKey(sk)) {
+                    sourceSpeedMap.put(sk, System.currentTimeMillis() - start);
                 }
-                resultVods.get(video.sourceKey).add(video);
-                if (video.sourceKey != lastSourceKey) {
-                    lastSourceKey = this.addWordAdapterIfNeed(video.sourceKey);
+                if (!resultVods.containsKey(sk)) {
+                    resultVods.put(sk, new ArrayList<Movie.Video>());
+                }
+                resultVods.get(sk).add(video);
+                if (!sk.equals(lastSourceKey)) {
+                    lastSourceKey = this.addWordAdapterIfNeed(sk);
                 }
             }
-
-            if (searchAdapter.getData().size() > 0) {
-                searchAdapter.addData(data);
-            } else {
-                showSuccess();
-                if (!isFilterMode)
-                    mGridView.setVisibility(View.VISIBLE);
-                searchAdapter.setNewData(data);
-            }
+            aggregateAndSort();
         }
 
         int count = allRunCount.decrementAndGet();
         if (count <= 0) {
-            if (searchAdapter.getData().size() == 0) {
+            aggregateAndSort();
+            if (aggregatedAdapter.getData().isEmpty()) {
                 showEmpty();
             }
             cancel();
         }
+    }
+
+    private void aggregateAndSort() {
+        Map<String, AggregatedResult> groups = new LinkedHashMap<>();
+        synchronized (allResults) {
+            for (Movie.Video video : allResults) {
+                String key = AggregatedResult.normalize(video.name);
+                AggregatedResult group = groups.get(key);
+                if (group == null) {
+                    group = new AggregatedResult(key, video.name);
+                    group.relevanceScore = AggregatedResult.scoreRelevance(video.name, searchTitle);
+                    groups.put(key, group);
+                }
+                String sourceName = "";
+                try {
+                    sourceName = ApiConfig.get().getSource(video.sourceKey).getName();
+                } catch (Exception ignored) {}
+                long speed = sourceSpeedMap.containsKey(video.sourceKey)
+                        ? sourceSpeedMap.get(video.sourceKey) : 0;
+                group.addSource(new SourceResult(video.sourceKey, sourceName, speed, video));
+            }
+        }
+
+        List<AggregatedResult> sorted = new ArrayList<>(groups.values());
+        for (AggregatedResult group : sorted) {
+            group.fillFromFirstSource();
+            group.sortSourcesBySpeed();
+        }
+        Collections.sort(sorted, new Comparator<AggregatedResult>() {
+            @Override
+            public int compare(AggregatedResult a, AggregatedResult b) {
+                return Float.compare(b.relevanceScore, a.relevanceScore);
+            }
+        });
+
+        List<MultiItemEntity> items = new ArrayList<>();
+        for (AggregatedResult group : sorted) {
+            items.add(group);
+        }
+
+        if (!items.isEmpty()) {
+            showSuccess();
+            if (!isFilterMode)
+                mGridView.setVisibility(View.VISIBLE);
+        }
+        aggregatedAdapter.setNewData(items);
     }
 
     private void cancel() {

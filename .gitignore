@@ -98,3 +98,16 @@ lint/tmp/
 
 *.hprof
 output-metadata.json
+
+# Dev log (session auto-generated)
+dev-log/*.md
+
+# Claude Code
+.claude/memory/
+.claude/plans/
+
+# Signing keys
+app/release.keystore
+
+# External tools
+claude-project-builder-main/

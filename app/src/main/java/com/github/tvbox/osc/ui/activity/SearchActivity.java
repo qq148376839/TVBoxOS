@@ -28,8 +28,12 @@ import com.github.tvbox.osc.bean.Movie;
 import com.github.tvbox.osc.bean.SourceBean;
 import com.github.tvbox.osc.event.RefreshEvent;
 import com.github.tvbox.osc.event.ServerEvent;
+import com.github.tvbox.osc.bean.AggregatedResult;
+import com.github.tvbox.osc.bean.SourceResult;
 import com.github.tvbox.osc.ui.adapter.PinyinAdapter;
 import com.github.tvbox.osc.ui.adapter.SearchAdapter;
+import com.github.tvbox.osc.ui.adapter.SearchAggregatedAdapter;
+import com.chad.library.adapter.base.entity.MultiItemEntity;
 import com.github.tvbox.osc.ui.dialog.RemoteDialog;
 import com.github.tvbox.osc.ui.dialog.SearchCheckboxDialog;
 import com.github.tvbox.osc.ui.tv.widget.SearchKeyboard;
@@ -56,8 +60,13 @@ import org.greenrobot.eventbus.Subscribe;
 import org.greenrobot.eventbus.ThreadMode;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -78,6 +87,7 @@ public class SearchActivity extends BaseActivity {
     private TextView tvClear;
     private SearchKeyboard keyboard;
     private SearchAdapter searchAdapter;
+    private SearchAggregatedAdapter aggregatedAdapter;
     private PinyinAdapter wordAdapter;
     private String searchTitle = "";
     private TextView tvSearchCheckboxBtn;
@@ -86,6 +96,10 @@ public class SearchActivity extends BaseActivity {
     private SearchCheckboxDialog mSearchCheckboxDialog = null;
 
     private TextView wordsSwitch;
+
+    private final ConcurrentHashMap<String, Long> sourceStartTime = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> sourceSpeedMap = new ConcurrentHashMap<>();
+    private final List<Movie.Video> allResults = Collections.synchronizedList(new ArrayList<>());
 
     @Override
     protected int getLayoutResID() {
@@ -157,35 +171,41 @@ public class SearchActivity extends BaseActivity {
             }
         });
         mGridView.setHasFixedSize(true);
-        // lite
-        if (Hawk.get(HawkConfig.SEARCH_VIEW, 0) == 0)
-            mGridView.setLayoutManager(new V7LinearLayoutManager(this.mContext, 1, false));
-            // with preview
-        else
-            mGridView.setLayoutManager(new V7GridLayoutManager(this.mContext, 3));
-        searchAdapter = new SearchAdapter();
-        mGridView.setAdapter(searchAdapter);
-        searchAdapter.setOnItemClickListener(new BaseQuickAdapter.OnItemClickListener() {
+        mGridView.setLayoutManager(new V7LinearLayoutManager(this.mContext, 1, false));
+        aggregatedAdapter = new SearchAggregatedAdapter();
+        mGridView.setAdapter(aggregatedAdapter);
+        aggregatedAdapter.setOnItemClickListener(new BaseQuickAdapter.OnItemClickListener() {
             @Override
             public void onItemClick(BaseQuickAdapter adapter, View view, int position) {
                 FastClickCheckUtil.check(view);
-                Movie.Video video = searchAdapter.getData().get(position);
-                if (video != null) {
-                    try {
-                        if (searchExecutorService != null) {
-                            pauseRunnable = searchExecutorService.shutdownNow();
-                            searchExecutorService = null;
-                            JsLoader.stopAll();
-                        }
-                    } catch (Throwable th) {
-                        th.printStackTrace();
+                MultiItemEntity item = aggregatedAdapter.getData().get(position);
+                if (item instanceof AggregatedResult) {
+                    AggregatedResult header = (AggregatedResult) item;
+                    if (header.isExpanded()) {
+                        aggregatedAdapter.collapse(position);
+                    } else {
+                        aggregatedAdapter.expand(position);
                     }
-                    hasKeyBoard = false;
-                    isSearchBack = true;
-                    Bundle bundle = new Bundle();
-                    bundle.putString("id", video.id);
-                    bundle.putString("sourceKey", video.sourceKey);
-                    jumpActivity(DetailActivity.class, bundle);
+                } else if (item instanceof SourceResult) {
+                    SourceResult source = (SourceResult) item;
+                    Movie.Video video = source.video;
+                    if (video != null) {
+                        try {
+                            if (searchExecutorService != null) {
+                                pauseRunnable = searchExecutorService.shutdownNow();
+                                searchExecutorService = null;
+                                JsLoader.stopAll();
+                            }
+                        } catch (Throwable th) {
+                            th.printStackTrace();
+                        }
+                        hasKeyBoard = false;
+                        isSearchBack = true;
+                        Bundle bundle = new Bundle();
+                        bundle.putString("id", video.id);
+                        bundle.putString("sourceKey", video.sourceKey);
+                        jumpActivity(DetailActivity.class, bundle);
+                    }
                 }
             }
         });
@@ -483,7 +503,10 @@ public class SearchActivity extends BaseActivity {
 
         this.searchTitle = title;
         mGridView.setVisibility(View.INVISIBLE);
-        searchAdapter.setNewData(new ArrayList<>());
+        aggregatedAdapter.setNewData(new ArrayList<>());
+        allResults.clear();
+        sourceStartTime.clear();
+        sourceSpeedMap.clear();
         searchResult();
     }
 
@@ -500,7 +523,7 @@ public class SearchActivity extends BaseActivity {
         } catch (Throwable th) {
             th.printStackTrace();
         } finally {
-            searchAdapter.setNewData(new ArrayList<>());
+            aggregatedAdapter.setNewData(new ArrayList<>());
             allRunCount.set(0);
         }
         searchExecutorService = Executors.newFixedThreadPool(5);
@@ -530,6 +553,7 @@ public class SearchActivity extends BaseActivity {
             searchExecutorService.execute(new Runnable() {
                 @Override
                 public void run() {
+                    sourceStartTime.put(key, System.currentTimeMillis());
                     sourceViewModel.getSearch(key, searchTitle);
                 }
             });
@@ -549,26 +573,71 @@ public class SearchActivity extends BaseActivity {
 
     private void searchData(AbsXml absXml) {
         if (absXml != null && absXml.movie != null && absXml.movie.videoList != null && absXml.movie.videoList.size() > 0) {
-            List<Movie.Video> data = new ArrayList<>();
             for (Movie.Video video : absXml.movie.videoList) {
-                if (matchSearchResult(video.name, searchTitle)) data.add(video);
+                if (!matchSearchResult(video.name, searchTitle)) continue;
+                allResults.add(video);
+                String sk = video.sourceKey;
+                Long start = sourceStartTime.get(sk);
+                if (start != null && !sourceSpeedMap.containsKey(sk)) {
+                    sourceSpeedMap.put(sk, System.currentTimeMillis() - start);
+                }
             }
-            if (searchAdapter.getData().size() > 0) {
-                searchAdapter.addData(data);
-            } else {
-                showSuccess();
-                mGridView.setVisibility(View.VISIBLE);
-                searchAdapter.setNewData(data);
-            }
+            aggregateAndSort();
         }
 
         int count = allRunCount.decrementAndGet();
         if (count <= 0) {
-            if (searchAdapter.getData().size() <= 0) {
+            aggregateAndSort();
+            if (aggregatedAdapter.getData().isEmpty()) {
                 showEmpty();
             }
             cancel();
         }
+    }
+
+    private void aggregateAndSort() {
+        Map<String, AggregatedResult> groups = new LinkedHashMap<>();
+        synchronized (allResults) {
+            for (Movie.Video video : allResults) {
+                String key = AggregatedResult.normalize(video.name);
+                AggregatedResult group = groups.get(key);
+                if (group == null) {
+                    group = new AggregatedResult(key, video.name);
+                    group.relevanceScore = AggregatedResult.scoreRelevance(video.name, searchTitle);
+                    groups.put(key, group);
+                }
+                String sourceName = "";
+                try {
+                    sourceName = ApiConfig.get().getSource(video.sourceKey).getName();
+                } catch (Exception ignored) {}
+                long speed = sourceSpeedMap.containsKey(video.sourceKey)
+                        ? sourceSpeedMap.get(video.sourceKey) : 0;
+                group.addSource(new SourceResult(video.sourceKey, sourceName, speed, video));
+            }
+        }
+
+        List<AggregatedResult> sorted = new ArrayList<>(groups.values());
+        for (AggregatedResult group : sorted) {
+            group.fillFromFirstSource();
+            group.sortSourcesBySpeed();
+        }
+        Collections.sort(sorted, new Comparator<AggregatedResult>() {
+            @Override
+            public int compare(AggregatedResult a, AggregatedResult b) {
+                return Float.compare(b.relevanceScore, a.relevanceScore);
+            }
+        });
+
+        List<MultiItemEntity> items = new ArrayList<>();
+        for (AggregatedResult group : sorted) {
+            items.add(group);
+        }
+
+        if (!items.isEmpty()) {
+            showSuccess();
+            mGridView.setVisibility(View.VISIBLE);
+        }
+        aggregatedAdapter.setNewData(items);
     }
 
 
